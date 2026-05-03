@@ -104,6 +104,19 @@ header {
   color: var(--primary);
 }
 
+.brand-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.version-tag {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-light);
+  line-height: 1;
+  margin-top: -2px;
+}
+
 .header-actions {
   display: flex;
   gap: 8px;

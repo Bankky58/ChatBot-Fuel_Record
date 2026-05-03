@@ -3,7 +3,39 @@ import { auth, googleProvider, db } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, type User } from 'firebase/auth';
 import { collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp, getDocs, updateDoc, doc, deleteDoc, writeBatch } from 'firebase/firestore';
 import { LogIn, LogOut, Send, Fuel, History, X, ChevronLeft, ChevronRight, Trash2, Edit2, Check } from 'lucide-react';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import './App.css';
+
+// Initialize Gemini AI
+const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ 
+  model: "gemini-2.5-flash-lite",
+  systemInstruction: `You are a warm, helpful fuel tracking assistant. 
+  
+  Your primary goal is to extract fuel record data.
+  
+  JSON STRUCTURE:
+  {
+    "cost": number | null,
+    "volume": number | null,
+    "date": "YYYY-MM-DD" | null,
+    "isNewEvent": boolean,
+    "message": "Your friendly response"
+  }
+
+  RULES for 'isNewEvent':
+  1. Set 'isNewEvent' to TRUE if the user is describing a brand new refueling stop.
+  2. Set 'isNewEvent' to FALSE if the user is just providing missing details (like liters or date) for the stop you just discussed in the history.
+  
+  EXAMPLE:
+  User: "Spent $50" -> isNewEvent: true
+  User: "It was 20 liters" -> isNewEvent: false (adding detail to the $50)
+  User: "Oh, and yesterday I spent $20" -> isNewEvent: true (new separate event)
+  `,
+  generationConfig: {
+    responseMimeType: "application/json",
+  }
+});
 
 interface Message {
   id: string;
@@ -32,11 +64,12 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
+  const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
   const [monthlyHistory, setMonthlyHistory] = useState<MonthlyData[]>([]);
   const [currentMonthIndex, setCurrentMonthIndex] = useState(0);
-  const [pendingRecordId, setPendingRecordId] = useState<string | null>(null);
+  const [lastRecordId, setLastRecordId] = useState<string | null>(null);
   
   // Edit State
   const [editingRecordId, setEditingRecordId] = useState<string | null>(null);
@@ -143,6 +176,7 @@ const App: React.FC = () => {
       const batch = writeBatch(db);
       snapshot.forEach((doc) => batch.delete(doc.ref));
       await batch.commit();
+      setLastRecordId(null);
       
       await addDoc(collection(db, `users/${user.uid}/messages`), {
         text: "Chat cleared. I'm ready for new records!",
@@ -158,6 +192,7 @@ const App: React.FC = () => {
     if (!user || !window.confirm("Are you sure you want to delete this record?")) return;
     try {
       await deleteDoc(doc(db, `users/${user.uid}/fuel_records`, recordId));
+      if (lastRecordId === recordId) setLastRecordId(null);
       await fetchMonthlyHistory();
     } catch (err: any) {
       alert("Delete failed: " + err.message);
@@ -191,11 +226,6 @@ const App: React.FC = () => {
     } catch (err: any) {
       alert("Update failed: " + err.message);
     }
-  };
-
-  const parseNumber = (text: string) => {
-    const match = text.match(/(\d+(\.\d+)?)/);
-    return match ? { value: parseFloat(match[0]), valid: true } : { valid: false };
   };
 
   const formatTime = (timestamp: any) => {
@@ -240,83 +270,93 @@ const App: React.FC = () => {
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !user) return;
-    // Clean up the input: trim spaces and remove any invisible characters mobile keyboards might add
-    const userMessage = input.trim().replace(/[\u200B-\u200D\uFEFF]/g, '');
+    if (!input.trim() || !user || isTyping) return;
+    
+    const rawInput = input.trim();
+    const userMessage = rawInput.replace(/[\u200B-\u200D\uFEFF]/g, '');
     setInput('');
 
     try {
-      // Command Handling (Case-insensitive and handles potential leading spaces)
       if (userMessage.startsWith('/')) {
         const command = userMessage.toLowerCase().split(' ')[0];
-        if (command === '/clear') {
-          await clearChat();
-          return;
-        }
+        if (command === '/clear') { await clearChat(); return; }
         if (command === '/help') {
           await addDoc(collection(db, `users/${user.uid}/messages`), {
             text: "Available commands:\n/clear - Clear chat history\n/history - Show spending history\n/help - Show this help message",
-            sender: 'bot',
-            timestamp: serverTimestamp()
+            sender: 'bot', timestamp: serverTimestamp()
           });
           return;
         }
-        if (command === '/summary' || command === '/history') {
-          await fetchMonthlyHistory();
-          return;
-        }
-        // Fallback for unknown command
+        if (command === '/summary' || command === '/history') { await fetchMonthlyHistory(); return; }
         await addDoc(collection(db, `users/${user.uid}/messages`), {
-          text: `Unknown command: ${command}. Try /clear or /history`,
-          sender: 'bot',
-          timestamp: serverTimestamp()
+          text: `Unknown command: ${command}. Try /clear or /history`, sender: 'bot', timestamp: serverTimestamp()
         });
         return;
       }
 
-      // Save user message
       await addDoc(collection(db, `users/${user.uid}/messages`), {
         text: userMessage, sender: 'user', timestamp: serverTimestamp()
       });
 
-      if (pendingRecordId) {
-        const parsedVolume = parseNumber(userMessage);
-        if (parsedVolume.valid) {
-          await updateDoc(doc(db, `users/${user.uid}/fuel_records`, pendingRecordId), {
-            volume: parsedVolume.value
-          });
-          await addDoc(collection(db, `users/${user.uid}/messages`), {
-            text: `Got it! Recorded ${parsedVolume.value} liters.`, sender: 'bot', timestamp: serverTimestamp()
-          });
-          setPendingRecordId(null);
-        } else if (userMessage.toLowerCase() === 'skip' || userMessage.toLowerCase() === 'no') {
-          await addDoc(collection(db, `users/${user.uid}/messages`), {
-            text: "No problem. Record saved without volume.", sender: 'bot', timestamp: serverTimestamp()
-          });
-          setPendingRecordId(null);
-        } else {
-          await addDoc(collection(db, `users/${user.uid}/messages`), {
-            text: "I didn't catch that. How many liters? (Or type 'skip')", sender: 'bot', timestamp: serverTimestamp()
-          });
+      setIsTyping(true);
+
+      let history = messages.slice(-10).map(m => ({
+        role: m.sender === 'user' ? ( 'user' as const ) : ( 'model' as const ),
+        parts: [{ text: m.text }]
+      }));
+
+      const firstUserIndex = history.findIndex(h => h.role === 'user');
+      if (firstUserIndex !== -1) history = history.slice(firstUserIndex);
+      else history = [];
+
+      const chat = model.startChat({ history });
+      const result = await chat.sendMessage(userMessage);
+      const response = await result.response;
+      const text = response.text();
+      
+      try {
+        const data = JSON.parse(text);
+
+        if (data.cost) {
+          const recordTimestamp = data.date ? new Date(data.date) : serverTimestamp();
+          
+          if (data.isNewEvent || !lastRecordId) {
+            // Start a new record
+            const docRef = await addDoc(collection(db, `users/${user.uid}/fuel_records`), {
+              cost: data.cost,
+              volume: data.volume || null,
+              rawMessage: userMessage,
+              timestamp: recordTimestamp
+            });
+            setLastRecordId(docRef.id);
+          } else {
+            // Update the existing record session
+            await updateDoc(doc(db, `users/${user.uid}/fuel_records`, lastRecordId), {
+              cost: data.cost,
+              volume: data.volume || null,
+              timestamp: recordTimestamp
+            });
+          }
         }
-      } else {
-        const parsedCost = parseNumber(userMessage);
-        if (parsedCost.valid) {
-          const docRef = await addDoc(collection(db, `users/${user.uid}/fuel_records`), {
-            cost: parsedCost.value, rawMessage: userMessage, timestamp: serverTimestamp()
-          });
-          setPendingRecordId(docRef.id);
-          await addDoc(collection(db, `users/${user.uid}/messages`), {
-            text: `Recorded $${parsedCost.value}. How many liters did you get?`, sender: 'bot', timestamp: serverTimestamp()
-          });
-        } else {
-          await addDoc(collection(db, `users/${user.uid}/messages`), {
-            text: "I didn't catch the amount. Could you please just type the cost?", sender: 'bot', timestamp: serverTimestamp()
-          });
-        }
+
+        await addDoc(collection(db, `users/${user.uid}/messages`), {
+          text: data.message || "Recorded!",
+          sender: 'bot',
+          timestamp: serverTimestamp()
+        });
+
+      } catch (jsonErr) {
+        console.error("JSON Error:", jsonErr, text);
+        await addDoc(collection(db, `users/${user.uid}/messages`), {
+          text: "I had a bit of trouble understanding. Could you try again?",
+          sender: 'bot', timestamp: serverTimestamp()
+        });
       }
+
     } catch (err: any) {
       alert("Error: " + err.message);
+    } finally {
+      setIsTyping(false);
     }
   };
 
@@ -347,7 +387,10 @@ const App: React.FC = () => {
         <div className="header-content">
           <div className="brand">
             <Fuel size={24} />
-            <h2>Fuel Bot</h2>
+            <div className="brand-text">
+              <h2>Fuel Bot</h2>
+              <span className="version-tag">v2.6</span>
+            </div>
           </div>
           <div className="header-actions">
             <button onClick={fetchMonthlyHistory} className="header-icon-btn">
@@ -428,14 +471,21 @@ const App: React.FC = () => {
               </div>
             </div>
           ))}
+          {isTyping && (
+            <div className="message-wrapper bot">
+              <div className="message-bubble typing">
+                Bot is thinking...
+              </div>
+            </div>
+          )}
           <div ref={messagesEndRef} />
         </div>
       </main>
 
       <footer className="input-area">
         <form onSubmit={handleSendMessage} className="input-form">
-          <input type="text" value={input} onChange={(e) => setInput(e.target.value)} placeholder={pendingRecordId ? "How many liters?" : "Type fuel cost (e.g. 50)"} />
-          <button type="submit" disabled={!input.trim()}><Send size={20} /></button>
+          <input type="text" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Type fuel cost (e.g. 50)" />
+          <button type="submit" disabled={!input.trim() || isTyping}><Send size={20} /></button>
         </form>
       </footer>
     </div>
