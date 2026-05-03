@@ -1,0 +1,21 @@
+# Large folders
+node_modules/
+client/node_modules/
+dist/
+client/dist/
+.firebase/
+client/.firebase/
+
+# Private keys and local config
+.env
+client/.env
+.env.local
+credentials.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
